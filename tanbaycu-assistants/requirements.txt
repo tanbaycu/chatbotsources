@@ -1,0 +1,9 @@
+pyTelegramBotAPI
+asyncio
+qrcode
+telebot
+aiohttp
+Pillow
+numpy
+scikit-learn
+g4f
