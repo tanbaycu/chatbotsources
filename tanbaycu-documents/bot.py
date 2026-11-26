@@ -1,12 +1,14 @@
 import os
 import io
 import logging
-from typing import Dict, List, Any, Optional
+import sys
+from pathlib import Path
+from typing import List, Any, Optional
 import asyncio
 import httpx
-import re
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 from telegram.error import BadRequest
 
@@ -16,6 +18,15 @@ from google import genai
 # Import deep_translator for Vietnamese translation
 from deep_translator import GoogleTranslator
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from shared.gemini_utils import get_gemini_model  # noqa: E402
+
+load_dotenv(ROOT_DIR / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 # Enable logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,25 +34,30 @@ logger = logging.getLogger(__name__)
 # States for conversation handler
 MAIN_MENU, ANALYZING, UPLOADING, LANGUAGE_SELECTION = range(4)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # Replace with your actual Telegram bot token
-GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")        # Replace with your actual Google API key
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN_NE") or "").strip()
+GOOGLE_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+GEMINI_MODEL = get_gemini_model()
 
 class SimplePDFBot:
     """A user-friendly Telegram bot for PDF analysis using Google's Gemini model."""
     
-    def __init__(self):
-        """Initialize the bot with hardcoded API keys."""
-        # Set Google API key directly
-        os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
-        
-        # Initialize the Google Generative AI client
-        self.client = genai.Client()
+    def __init__(self, telegram_token: Optional[str] = None, api_key: Optional[str] = None):
+        """Initialize the PDF bot and configure Gemini + Telegram application lazily without hardcoded secrets."""
+        resolved_token = (telegram_token or TELEGRAM_TOKEN).strip()
+        resolved_key = (api_key or GOOGLE_API_KEY).strip()
+        if not resolved_key:
+            raise RuntimeError("Thiếu GEMINI_API_KEY (hoặc GOOGLE_API_KEY) trong biến môi trường.")
+        if not resolved_token:
+            raise RuntimeError("Thiếu TELEGRAM_TOKEN trong biến môi trường.")
+
+        # Initialize the Google Generative AI client cleanly with explicit key
+        self.client = genai.Client(api_key=resolved_key)
         
         # Store user data: {user_id: {"files": {file_name: file_ref}, "current_file": file_name, "language": "en|vi", "messages": [message_ids]}}
         self.user_data = {}
         
         # Create the Telegram application
-        self.application = Application.builder().token(TELEGRAM_TOKEN).build()
+        self.application = Application.builder().token(resolved_token).build()
         
         # Add handlers
         self.add_handlers()
@@ -1227,7 +1243,7 @@ class SimplePDFBot:
     async def handle_pdf_in_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Handle PDF document uploads in upload state."""
         # Same as handle_pdf but returns to MAIN_MENU
-        result = await self.handle_pdf(update, context)
+        await self.handle_pdf(update, context)
         return MAIN_MENU
     
     async def handle_text_in_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1371,22 +1387,20 @@ class SimplePDFBot:
         
         return uploaded_file
     
-    async def analyze_document(self, file_ref: Any, prompt: str, model: str = "gemini-1.5-flash") -> str:
-        """Analyze a document with a specific prompt."""
-        # Generate content using the file and prompt
+    async def analyze_document(self, file_ref: Any, prompt: str, model: Optional[str] = None) -> str:
+        """Analyze a document with a specific prompt using the configured Gemini model."""
         response = self.client.models.generate_content(
-            model=model,
+            model=model or get_gemini_model(),
             contents=[file_ref, prompt]
         )
         
         return response.text
     
-    async def compare_documents(self, file_refs: List[Any], prompt: str, model: str = "gemini-1.5-flash") -> str:
-        """Compare multiple documents with a specific prompt."""
-        # Generate content using the files and prompt
+    async def compare_documents(self, file_refs: List[Any], prompt: str, model: Optional[str] = None) -> str:
+        """Compare multiple documents with a specific prompt using the configured Gemini model."""
         contents = file_refs + [prompt]
         response = self.client.models.generate_content(
-            model=model,
+            model=model or get_gemini_model(),
             contents=contents
         )
         

@@ -5,24 +5,46 @@ import logging
 import os
 import base64
 import re
+import sys
 import traceback
 import tempfile
-import requests
-import telebot
 import time
 from collections import deque
-from typing import Dict, List, Optional, Union, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
 from telebot.async_telebot import AsyncTeleBot
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
 import io
 import random
 from functools import lru_cache
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from g4f.client import Client
 from PIL import Image
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    TfidfVectorizer = None
+    cosine_similarity = None
+    SKLEARN_AVAILABLE = False
+
+try:
+    from g4f.client import Client
+    G4F_AVAILABLE = True
+except ImportError:
+    Client = None
+    G4F_AVAILABLE = False
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from shared.gemini_utils import build_gemini_endpoint, build_gemini_headers, get_gemini_model  # noqa: E402
+
+load_dotenv(ROOT_DIR / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Cấu hình logging
 logging.basicConfig(
@@ -30,13 +52,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Cấu hình bot
-BOT_TOKEN = os.getenv("BOT_TOKEN_NE")
-PRIMARY_API_KEY = os.getenv("GEMINI_KEY")
-SECONDARY_API_KEY = os.getenv("GEMINI_KEY_BACKUP")
-API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
+# Cấu hình bot (hỗ trợ cả tên env cũ và chuẩn mới, không truyền API key qua query URL)
+BOT_TOKEN = (os.getenv("BOT_TOKEN_NE") or os.getenv("TELEGRAM_TOKEN") or "").strip()
+PRIMARY_API_KEY = (os.getenv("GEMINI_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+SECONDARY_API_KEY = (os.getenv("GEMINI_KEY_BACKUP") or "").strip()
+GEMINI_MODEL = get_gemini_model()
+API_URL = build_gemini_endpoint(GEMINI_MODEL)
 
-bot = AsyncTeleBot(BOT_TOKEN)
+# Tránh crash ngay lúc import khi chạy kiểm thử tĩnh/CI chưa cấu hình TELEGRAM_TOKEN
+bot = AsyncTeleBot(BOT_TOKEN or "0:unconfigured")
 executor = ThreadPoolExecutor(max_workers=50)
 
 
@@ -53,7 +77,7 @@ class ErrorCodes:
 class APIKeyManager:
     def __init__(self):
         self.primary_key = PRIMARY_API_KEY
-        self.secondary_key = SECONDARY_API_KEY
+        self.secondary_key = SECONDARY_API_KEY or PRIMARY_API_KEY
         self.current_key = self.primary_key
         self.last_switch_time = 0
         self.error_count = 0
@@ -63,6 +87,8 @@ class APIKeyManager:
 
     async def get_current_key(self):
         async with self.lock:
+            if not self.current_key:
+                raise RuntimeError("Thiếu GEMINI_KEY hoặc GEMINI_API_KEY trong biến môi trường.")
             current_time = time.time()
             time_since_last = current_time - self.last_request_time
             if time_since_last < self.min_delay:
@@ -75,7 +101,7 @@ class APIKeyManager:
             current_time = time.time()
             if error_code == 429:  # Rate limit error
                 self.error_count += 1
-                if current_time - self.last_switch_time > 60:
+                if current_time - self.last_switch_time > 60 and self.secondary_key:
                     self.current_key = (
                         self.secondary_key
                         if self.current_key == self.primary_key
@@ -98,7 +124,7 @@ class AdvancedMemoryHandler:
         self.file_path = f"memory_{user_id}.json"
         self.short_term_memory = deque(maxlen=15)
         self.long_term_memory = deque(maxlen=200)
-        self.vectorizer = TfidfVectorizer()
+        self.vectorizer = TfidfVectorizer() if SKLEARN_AVAILABLE else None
         self.load_memory()
 
     def load_memory(self):
@@ -121,23 +147,24 @@ class AdvancedMemoryHandler:
         if not all_messages:
             return []
 
-        # Vectorize messages
-        message_texts = [msg["content"] for msg in all_messages] + [user_message]
-        tfidf_matrix = self.vectorizer.fit_transform(message_texts)
+        if self.vectorizer is not None and cosine_similarity is not None:
+            message_texts = [msg["content"] for msg in all_messages] + [user_message]
+            tfidf_matrix = self.vectorizer.fit_transform(message_texts)
+            user_message_vector = tfidf_matrix[-1]
+            similarities = cosine_similarity(user_message_vector, tfidf_matrix[:-1])[0]
+        else:
+            # Fallback thuần Python (Jaccard) khi không cài scikit-learn
+            query_tokens = set(re.findall(r"\w+", user_message.lower()))
+            similarities = []
+            for msg in all_messages:
+                msg_tokens = set(re.findall(r"\w+", str(msg.get("content", "")).lower()))
+                union = query_tokens | msg_tokens
+                similarities.append((len(query_tokens & msg_tokens) / len(union)) if union else 0.0)
 
-        # Calculate similarity
-        user_message_vector = tfidf_matrix[-1]
-        similarities = cosine_similarity(user_message_vector, tfidf_matrix[:-1])[0]
-
-        # Sort messages by similarity
         sorted_messages = sorted(
             zip(all_messages, similarities), key=lambda x: x[1], reverse=True
         )
-
-        # Select top relevant messages
-        relevant_messages = [msg for msg, _ in sorted_messages[:max_context]]
-
-        return relevant_messages
+        return [msg for msg, _ in sorted_messages[:max_context]]
 
     def extract_key_information(self, message):
         # Improved key information extraction
@@ -548,22 +575,6 @@ class AdvancedPromptGenerator:
         complexity = self.detect_complexity(user_message)
         conversation_stage = self.determine_conversation_stage(user_history)
 
-        personality = self.select_personality(topic, sentiment, complexity)
-        emoji_count = (
-            3
-            if personality["emoji_level"] == "cao"
-            else (2 if personality["emoji_level"] == "trung bình" else 1)
-        )
-        emojis = self.get_emojis(topic, emoji_count)
-        emoji_str = " ".join(emojis)
-
-        opening = self.select_opening_phrase(conversation_stage)
-        closing = random.choice(self.closing_phrases)
-        transitions = random.sample(
-            self.transition_phrases, min(2, len(self.transition_phrases))
-        )
-        confidence_phrase = random.choice(self.confidence_phrases)
-
         prompt = f"""
 Bạn là Zephyr, trợ lý AI từ tanbaycu, như một người bạn đồng hành của Gen Z, hỗ trợ từ học tập, công việc, sáng tạo, đến drama đời thường hay câu hỏi ngẫu hứng. Zephyr mang năng lượng tích cực, thấu hiểu cảm xúc, sáng tạo thông minh, và luôn truyền cảm hứng. Dữ liệu cập nhật tới tháng 1/2025, đảm bảo thông tin chuẩn, bắt trend, đáng tin.
 
@@ -707,8 +718,8 @@ async def generate_response(prompt, user_id, session):
     for attempt in range(max_retries):
         try:
             current_key = await api_key_manager.get_current_key()
-            url = f"{API_URL}?key={current_key}"
-            headers = {"Content-Type": "application/json"}
+            url = API_URL
+            headers = build_gemini_headers(current_key)
 
             data = {
                 "contents": [{"parts": [{"text": enhanced_prompt}]}],
@@ -724,7 +735,7 @@ async def generate_response(prompt, user_id, session):
                 url, headers=headers, json=data, timeout=30
             ) as response:
                 if response.status == 429:
-                    new_key = await api_key_manager.handle_error(429)
+                    await api_key_manager.handle_error(429)
                     if attempt < max_retries - 1:
                         logger.warning(
                             f"Rate limit hit, retrying with different key... (Attempt {attempt + 1})"
@@ -1089,7 +1100,7 @@ async def handle_all_callbacks(call):
                 await bot.answer_callback_query(
                     call.id, "Đã xảy ra lỗi khi xử lý yêu cầu của bạn.", show_alert=True
                 )
-            except:
+            except Exception:
                 pass
         finally:
             # Luôn xóa người dùng khỏi active_requests khi hoàn thành
@@ -1231,13 +1242,12 @@ async def analyze_image(
 
         start_time = time.time()
         async with aiohttp.ClientSession() as session:
-            url = f"{API_URL}?key={current_key}"
-            async with session.post(url, json=data) as response:
+            headers = build_gemini_headers(current_key)
+            async with session.post(API_URL, headers=headers, json=data, timeout=30) as response:
                 if response.status == 429:
                     new_key = await api_key_manager.handle_error(429)
-                    # Retry with new key
-                    url = f"{API_URL}?key={new_key}"
-                    async with session.post(url, json=data) as retry_response:
+                    retry_headers = build_gemini_headers(new_key)
+                    async with session.post(API_URL, headers=retry_headers, json=data, timeout=30) as retry_response:
                         result = await retry_response.json()
                 else:
                     result = await response.json()
@@ -1296,7 +1306,7 @@ async def analyze_image(
                 text=error_message,
                 parse_mode="Markdown",
             )
-        except:
+        except Exception:
             await bot.edit_message_text(
                 chat_id=waiting_message.chat.id,
                 message_id=waiting_message.message_id,
@@ -1333,14 +1343,14 @@ async def handle_message(message):
                 for i, chunk in enumerate(chunks):
                     try:
                         if i == 0:
-                            sent_message = await bot.edit_message_text(
+                            await bot.edit_message_text(
                                 chat_id=thinking_message.chat.id,
                                 message_id=thinking_message.message_id,
                                 text=chunk,
                                 parse_mode="Markdown",
                             )
                         else:
-                            sent_message = await bot.send_message(
+                            await bot.send_message(
                                 chat_id=thinking_message.chat.id,
                                 text=chunk,
                                 parse_mode="Markdown",
@@ -1351,19 +1361,19 @@ async def handle_message(message):
                         )
                         if "can't parse entities" in str(e):
                             if i == 0:
-                                sent_message = await bot.edit_message_text(
+                                await bot.edit_message_text(
                                     chat_id=thinking_message.chat.id,
                                     message_id=thinking_message.message_id,
                                     text=chunk,
                                 )
                             else:
-                                sent_message = await bot.send_message(
+                                await bot.send_message(
                                     chat_id=thinking_message.chat.id, text=chunk
                                 )
 
             else:
                 try:
-                    sent_message = await bot.edit_message_text(
+                    await bot.edit_message_text(
                         chat_id=thinking_message.chat.id,
                         message_id=thinking_message.message_id,
                         text=full_response,
@@ -1383,7 +1393,7 @@ async def handle_message(message):
                             text=error_message,
                             parse_mode="Markdown",
                         )
-                    except:
+                    except Exception:
                         await bot.send_message(
                             chat_id=thinking_message.chat.id,
                             text=error_message,
@@ -1480,9 +1490,6 @@ async def send_info(message):
 async def send_update_history(message):
     """Hiển thị lịch sử cập nhật với phiên bản mới nhất và tùy chọn xem các phiên bản cũ"""
 
-    # Ngày cập nhật mới nhất
-    current_date = "21/04/2025"
-
     # Phiên bản mới nhất
     latest_version = """
 🖼️ *Cập nhật v1.9 (21/04/2025)*
@@ -1510,8 +1517,7 @@ async def send_update_history(message):
   - Nâng cao độ tin cậy với dữ liệu cập nhật tháng 1/2025
   - Khuyến khích khám phá qua nguồn uy tín như X, giữ vibe Gen Z 100%
 """.format(
-        date=current_date
-    )
+        )
 
     # Tạo tin nhắn chỉ hiển thị phiên bản mới nhất và nút xem thêm
     initial_message = (
@@ -1812,21 +1818,21 @@ async def handle_search(message):
             ]
             for i, chunk in enumerate(chunks):
                 if i == 0:
-                    sent_message = await bot.edit_message_text(
+                    await bot.edit_message_text(
                         chat_id=thinking_message.chat.id,
                         message_id=thinking_message.message_id,
                         text=chunk,
                         parse_mode="Markdown",
                     )
                 else:
-                    sent_message = await bot.send_message(
+                    await bot.send_message(
                         chat_id=thinking_message.chat.id,
                         text=chunk,
                         parse_mode="Markdown",
                     )
 
         else:
-            sent_message = await bot.edit_message_text(
+            await bot.edit_message_text(
                 chat_id=thinking_message.chat.id,
                 message_id=thinking_message.message_id,
                 text=search_result,
@@ -1864,8 +1870,7 @@ async def generate_search_response(
 
     try:
         current_key = await api_key_manager.get_current_key()
-        url = f"{API_URL}?key={current_key}"
-        headers = {"Content-Type": "application/json"}
+        headers = build_gemini_headers(current_key)
 
         data = {
             "contents": [{"parts": [{"text": enhanced_prompt}]}],
@@ -1878,13 +1883,13 @@ async def generate_search_response(
         }
 
         async with session.post(
-            url, headers=headers, json=data, timeout=30
+            API_URL, headers=headers, json=data, timeout=30
         ) as response:
             if response.status == 429:
                 new_key = await api_key_manager.handle_error(429)
-                url = f"{API_URL}?key={new_key}"
+                retry_headers = build_gemini_headers(new_key)
                 async with session.post(
-                    url, headers=headers, json=data, timeout=30
+                    API_URL, headers=retry_headers, json=data, timeout=30
                 ) as retry_response:
                     result = await retry_response.json()
             else:
@@ -1932,12 +1937,8 @@ IMAGE_CONFIG = {
     "default_negative_prompt": "ugly, deformed, noisy, blurry, distorted, out of focus, bad anatomy, extra limbs, poorly drawn face, poorly drawn hands, missing fingers",
 }
 
-# Tạo thư mục temp nếu chưa tồn tại
-os.makedirs(IMAGE_CONFIG["temp_dir"], exist_ok=True)
-
-# --- INITIALIZATION ---
-# Khởi tạo g4f client
-g4f_client = Client()
+# Tạo client g4f an toàn (chỉ khởi tạo khi package g4f sẵn sàng; tránh side-effect mkdir lúc import)
+g4f_client = Client() if G4F_AVAILABLE and Client is not None else None
 
 # Semaphore để giới hạn số lượng yêu cầu đồng thời
 image_generation_semaphore = asyncio.Semaphore(
@@ -2118,8 +2119,12 @@ async def generate_image_with_g4f(
     )
     model_name = model_config["name"]
     max_retries = model_config["max_retries"]
-    timeout = model_config["timeout"]
     cooldown = model_config["cooldown"]
+
+    if g4f_client is None:
+        logger.warning("Thư viện g4f chưa được cài đặt; không thể sinh ảnh.")
+        return None
+    os.makedirs(IMAGE_CONFIG["temp_dir"], exist_ok=True)
 
     # Kiểm tra cache trước
     cached_url = get_cached_image_url(prompt, model, negative_prompt)
@@ -2465,7 +2470,7 @@ async def handle_image_generation(message: Message):
                         # Xóa file tạm
                         try:
                             os.remove(temp_image_path)
-                        except:
+                        except Exception:
                             pass
                     else:
                         raise Exception("Không thể lưu hình ảnh tạm thời")
@@ -2483,7 +2488,7 @@ async def handle_image_generation(message: Message):
                 message_id=waiting_message.message_id,
                 parse_mode="Markdown",
             )
-        except:
+        except Exception:
             pass
 
     except Exception as e:
@@ -2501,7 +2506,7 @@ async def handle_image_generation(message: Message):
                 message_id=waiting_message.message_id,
                 parse_mode="Markdown",
             )
-        except:
+        except Exception:
             try:
                 await bot.send_message(
                     chat_id,
@@ -2509,7 +2514,7 @@ async def handle_image_generation(message: Message):
                     reply_to_message_id=message_id,
                     parse_mode="Markdown",
                 )
-            except:
+            except Exception:
                 pass
 
     finally:
@@ -2653,8 +2658,14 @@ async def handle_image_clear(message: Message):
 
 
 async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Thiếu BOT_TOKEN_NE hoặc TELEGRAM_TOKEN trong biến môi trường.")
+    if not PRIMARY_API_KEY:
+        raise RuntimeError("Thiếu GEMINI_KEY hoặc GEMINI_API_KEY trong biến môi trường.")
+
     logger.info(
-        "Bot đang chạy với mô hình Gemini 2.0, bộ nhớ tạm thời và khả năng phân tích hình ảnh..."
+        "Bot đang chạy với mô hình %s, bộ nhớ ngữ cảnh và khả năng phân tích hình ảnh...",
+        GEMINI_MODEL,
     )
     while True:
         try:

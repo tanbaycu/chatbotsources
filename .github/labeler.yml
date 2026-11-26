@@ -1,10 +1,10 @@
-frontend:
+bots:
   - changed-files:
-      - any-glob-to-any-file: ["src/**/*.{ts,tsx,css,scss,html}", "public/**/*"]
+      - any-glob-to-any-file: ["tanbaycu-*/**/*.py", "shared/**/*.py"]
 
-backend:
+tests:
   - changed-files:
-      - any-glob-to-any-file: ["server/**/*"]
+      - any-glob-to-any-file: ["tests/**/*.py"]
 
 documentation:
   - changed-files:
@@ -12,11 +12,4 @@ documentation:
 
 configuration:
   - changed-files:
-      - any-glob-to-any-file:
-          [
-            ".github/**/*",
-            "package.json",
-            "tsconfig.json",
-            "vite.config.ts",
-            "tailwind.config.js",
-          ]
+      - any-glob-to-any-file: [".github/**/*", "pyproject.toml", "**/requirements*.txt"]

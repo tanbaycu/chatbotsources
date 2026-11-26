@@ -1,20 +1,37 @@
 import os
 import logging
+import sys
 import tempfile
 import time
 import asyncio
-import subprocess
-import uuid
 import datetime
 import re
+from pathlib import Path
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-import requests
 from google import genai
 from deep_translator import GoogleTranslator
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GOOGLE_DRIVE_DEPS_AVAILABLE = True
+except ImportError:
+    service_account = None
+    build = None
+    MediaFileUpload = None
+    GOOGLE_DRIVE_DEPS_AVAILABLE = False
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from shared.gemini_utils import get_gemini_model  # noqa: E402
+
+load_dotenv(ROOT_DIR / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Configure logging
 logging.basicConfig(
@@ -23,30 +40,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GOOGLE_DRIVE_CREDENTIALS = ""
-GOOGLE_DRIVE_FOLDER_ID = "" 
+# Environment variables (khong hardcode credentials hay model cu)
+TELEGRAM_TOKEN = (os.environ.get("TELEGRAM_TOKEN") or os.environ.get("BOT_TOKEN_NE") or "").strip()
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+GEMINI_MODEL = get_gemini_model()
+GOOGLE_DRIVE_CREDENTIALS = os.environ.get("GOOGLE_DRIVE_CREDENTIALS", "").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
 
 # Video retention settings (in days)
 VIDEO_RETENTION_DAYS = 7  # Delete videos older than 7 days
 
-# Initialize Gemini client
-genai_client = genai.Client(api_key=GEMINI_API_KEY)
+_cached_genai_client = None
 
-# Initialize Google Drive API
-try:
-    credentials = service_account.Credentials.from_service_account_file(
-        GOOGLE_DRIVE_CREDENTIALS, 
-        scopes=['https://www.googleapis.com/auth/drive']
-    )
-    drive_service = build('drive', 'v3', credentials=credentials)
-    google_drive_available = True
-    logger.info("Google Drive API initialized successfully")
-except Exception as e:
-    logger.error(f"Google Drive initialization error: {e}")
-    google_drive_available = False
+
+def get_genai_client():
+    """Khởi tạo lười Gemini client để không làm crash quá trình import khi thiếu env."""
+    global _cached_genai_client
+    if _cached_genai_client is None:
+        api_key = (os.environ.get("GEMINI_API_KEY") or GEMINI_API_KEY or "").strip()
+        if not api_key:
+            raise RuntimeError("Thiếu GEMINI_API_KEY trong biến môi trường.")
+        _cached_genai_client = genai.Client(api_key=api_key)
+    return _cached_genai_client
+
+
+class _LazyGenAIClientProxy:
+    """Proxy trỏ tới Gemini client được khởi tạo lúc runtime."""
+
+    def __getattr__(self, item):
+        return getattr(get_genai_client(), item)
+
+
+genai_client = _LazyGenAIClientProxy()
+
+# Initialize Google Drive API only when explicitly configured
+drive_service = None
+google_drive_available = False
+if GOOGLE_DRIVE_DEPS_AVAILABLE and GOOGLE_DRIVE_CREDENTIALS and GOOGLE_DRIVE_FOLDER_ID:
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            GOOGLE_DRIVE_CREDENTIALS,
+            scopes=['https://www.googleapis.com/auth/drive']
+        )
+        drive_service = build('drive', 'v3', credentials=credentials)
+        google_drive_available = True
+        logger.info("Google Drive API initialized successfully")
+    except Exception as e:
+        logger.error(f"Google Drive initialization error: {e}")
+        google_drive_available = False
 
 # File size limits
 TELEGRAM_FILE_SIZE_LIMIT = 50 * 1024 * 1024  # 50MB in bytes
@@ -489,7 +530,7 @@ async def process_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         
         # Generate content using Gemini API with the URL in the prompt
         response = genai_client.models.generate_content(
-            model="gemini-2.0-flash-lite",
+            model=GEMINI_MODEL,
             contents=prompt
         )
         
@@ -630,7 +671,7 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 else:
                     # Google Drive upload failed
                     await status_message.edit_text(
-                        f"⚠️ Google Drive upload failed. Please try a smaller video or contact support."
+                        "⚠️ Google Drive upload failed. Please try a smaller video or contact support."
                     )
                     
                     # Clean up temporary files
@@ -693,7 +734,7 @@ async def process_with_gemini(update, context, status_message, video_path, file_
                     await process_with_url(update, context, status_message, drive_info['url'], actual_file_size, duration)
                 else:
                     await status_message.edit_text(
-                        f"⚠️ Google Drive upload failed. Please try a smaller video."
+                        "⚠️ Google Drive upload failed. Please try a smaller video."
                     )
             else:
                 await status_message.edit_text(
@@ -753,8 +794,8 @@ async def process_with_gemini(update, context, status_message, video_path, file_
         if "file size" in error_message.lower():
             # If the error is about file size, try Google Drive instead
             await status_message.edit_text(
-                f"⚠️ Gemini API rejected the video due to file size limitations.\n"
-                f"Switching to Google Drive upload..."
+                "⚠️ Gemini API rejected the video due to file size limitations.\n"
+                "Switching to Google Drive upload..."
             )
             
             # Try Google Drive upload as fallback
@@ -779,7 +820,7 @@ async def process_with_gemini(update, context, status_message, video_path, file_
                     await process_with_url(update, context, status_message, drive_info['url'], file_size, duration)
                 else:
                     await status_message.edit_text(
-                        f"⚠️ Google Drive upload failed. Please try a smaller video."
+                        "⚠️ Google Drive upload failed. Please try a smaller video."
                     )
             else:
                 await status_message.edit_text(
@@ -809,7 +850,7 @@ async def process_with_url(update, context, status_message, video_url, file_size
         
         # Generate content using Gemini API with the URL in the prompt
         response = genai_client.models.generate_content(
-            model="gemini-2.0-flash-lite",
+            model=GEMINI_MODEL,
             contents=prompt
         )
         
@@ -918,7 +959,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, custo
             # Generate content using Gemini API with file
             start_time = time.time()
             response = genai_client.models.generate_content(
-                model="gemini-2.0-flash-lite",
+                model=GEMINI_MODEL,
                 contents=[video_file, query]
             )
             analysis_time = time.time() - start_time
@@ -932,7 +973,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, custo
             # Generate content using Gemini API with URL in prompt
             start_time = time.time()
             response = genai_client.models.generate_content(
-                model="gemini-2.0-flash-lite",
+                model=GEMINI_MODEL,
                 contents=combined_prompt
             )
             analysis_time = time.time() - start_time
@@ -996,8 +1037,13 @@ def format_duration(seconds):
         return f"{minutes:02d}:{seconds:02d}"
 
 def main() -> None:
-    """Start the bot."""
-    # Create the Application
+    """Start the bot after verifying required environment configuration."""
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Thiếu TELEGRAM_TOKEN trong biến môi trường.")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Thiếu GEMINI_API_KEY trong biến môi trường.")
+
+    logger.info("Starting Video Analyzer Bot with model %s", GEMINI_MODEL)
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Add handlers

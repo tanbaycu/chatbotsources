@@ -1,0 +1,25 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment & credentials
+.env
+.env.*
+!.env.example
+*.json
+!package.json
+
+# Runtime artifacts & temporary files
+memory_*.json
+temp_images/
+*.log
+.DS_Store
+Thumbs.db
